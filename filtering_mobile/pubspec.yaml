@@ -1,0 +1,30 @@
+name: filtering_mobile
+description: ESKF filtering mobile app
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  geolocator: ^10.1.0       # GPS
+  flutter_compass: ^0.8.0   # Kompas (heading)
+  web_socket_channel: ^3.0.3
+  provider: ^6.1.2
+  path_provider: ^2.1.3
+  sensors_plus: ^5.0.0
+  flutter_dotenv: ^6.0.0
+  flutter_map: ^8.2.2
+  latlong2: ^0.9.1
+ 
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - .env
