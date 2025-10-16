@@ -41,11 +41,23 @@ if SERIAL_DEVICE:
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-# ---- csv init ----
-if not LOG_FILE.exists():
+# ---- CSV init & compatibility (deteksi apakah header sudah punya acc_m) ----
+_LOG_HAS_ACC = False
+if LOG_FILE.exists():
+    try:
+        with open(LOG_FILE, "r", newline="", encoding="utf-8") as f:
+            r = csv.reader(f)
+            first = next(r, None)
+            if isinstance(first, list) and "acc_m" in first:
+                _LOG_HAS_ACC = True
+    except Exception:
+        pass
+else:
     with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["recv_at_iso", "lat", "lon", "heading_deg", "sent_at"])
+        # Pakai header baru yg mencakup acc_m
+        w.writerow(["recv_at_iso", "lat", "lon", "heading_deg", "acc_m", "sent_at"])
+        _LOG_HAS_ACC = True
 
 def _validate_payload(d: dict) -> tuple[bool, str]:
     """
@@ -55,7 +67,8 @@ def _validate_payload(d: dict) -> tuple[bool, str]:
       'lat': float,
       'lon': float,
       'heading_deg': float,
-      'sent_at': str(ISO-8601)
+      'sent_at': str(ISO-8601),
+      'acc_m' | 'accuracy_m': optional float
     }
     """
     if not isinstance(d, dict):
@@ -71,13 +84,19 @@ def _validate_payload(d: dict) -> tuple[bool, str]:
         float(d["heading_deg"])
     except Exception:
         return False, "lat/lon/heading must be float"
-    # sent_at boleh string apa adanya; tidak diparse paksa agar robust
+    # sent_at dibiarkan string (robust terhadap format)
+    # acc_m / accuracy_m opsional
     return True, ""
 
-def _log_to_csv(lat: float, lon: float, heading: float, sent_at: str):
+def _log_to_csv(lat: float, lon: float, heading: float, sent_at: str, acc: float | None):
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow([now_iso(), f"{lat:.8f}", f"{lon:.8f}", f"{heading:.2f}", sent_at])
+        if _LOG_HAS_ACC:
+            w.writerow([now_iso(), f"{lat:.8f}", f"{lon:.8f}", f"{heading:.2f}", 
+                        (f"{acc:.2f}" if isinstance(acc, (int, float)) else ""), sent_at])
+        else:
+            # kompatibel dgn file lama yg belum ada kolom acc_m
+            w.writerow([now_iso(), f"{lat:.8f}", f"{lon:.8f}", f"{heading:.2f}", sent_at])
 
 def _forward_serial(lat: float, lon: float, heading: float):
     if _ser and _ser.writable():
@@ -118,15 +137,23 @@ async def _handle(ws: WebSocketServerProtocol):
             heading = float(data["heading_deg"])
             sent_at = str(data["sent_at"])
 
+            # terima acc opsional: 'acc_m' atau 'accuracy_m'
+            acc = data.get("acc_m", data.get("accuracy_m", None))
+            try:
+                acc = float(acc) if acc is not None else None
+            except Exception:
+                acc = None
+
             # tulis log lokal & forward serial (opsional)
-            _log_to_csv(lat, lon, heading, sent_at)
+            _log_to_csv(lat, lon, heading, sent_at, acc)
             _forward_serial(lat, lon, heading)
 
-            # kirim ACK balik (bisa dipakai RTT)
+            # kirim ACK balik (bisa dipakai RTT / health-check)
             try:
                 await ws.send(json.dumps({
                     "ack": True,
                     "received_at": now_iso(),
+                    "orig_sent_at": sent_at,   # echo timestamp dari payload
                 }))
             except Exception:
                 # jika kirim ack gagal, biarkan loop lanjut

@@ -19,7 +19,11 @@ class FilteringParams {
   final double gateGps;
   final double gateHeading;
   final double headingOffsetDeg;
-  final FilterMode? presetMode; // ⬅️ Tambahan baru
+  final FilterMode? presetMode; // preset
+
+  // NEW: exposed tuning
+  final double headingAlpha; // 0.05..0.9
+  final double maxDtSec;     // 0.05..2.0
 
   const FilteringParams({
     required this.gpsDistanceFilterM,
@@ -32,6 +36,8 @@ class FilteringParams {
     required this.gateHeading,
     required this.headingOffsetDeg,
     this.presetMode,
+    this.headingAlpha = 0.25,
+    this.maxDtSec = 0.5,
   });
 
   FilteringParams copyWith({
@@ -45,6 +51,8 @@ class FilteringParams {
     double? gateHeading,
     double? headingOffsetDeg,
     FilterMode? presetMode,
+    double? headingAlpha,
+    double? maxDtSec,
   }) {
     return FilteringParams(
       gpsDistanceFilterM: gpsDistanceFilterM ?? this.gpsDistanceFilterM,
@@ -57,6 +65,8 @@ class FilteringParams {
       gateHeading: gateHeading ?? this.gateHeading,
       headingOffsetDeg: headingOffsetDeg ?? this.headingOffsetDeg,
       presetMode: presetMode ?? this.presetMode,
+      headingAlpha: headingAlpha ?? this.headingAlpha,
+      maxDtSec: maxDtSec ?? this.maxDtSec,
     );
   }
 }
@@ -87,6 +97,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late double _headingOffsetDeg;
   FilterMode? _selectedMode;
 
+  // NEW state
+  late double _headingAlpha;
+  late double _maxDtSec;
+
   @override
   void initState() {
     super.initState();
@@ -100,7 +114,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _gateGps = p.gateGps;
     _gateHeading = p.gateHeading;
     _headingOffsetDeg = p.headingOffsetDeg;
-    _selectedMode = p.presetMode; // ⬅️ Restore preset saat dibuka kembali
+    _selectedMode = p.presetMode;
+    _headingAlpha = p.headingAlpha;
+    _maxDtSec = p.maxDtSec;
   }
 
   void _applyPreset(FilterMode mode) {
@@ -116,7 +132,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _gateHeading = 3.0;
           _gpsSigmaScaleK = 0.5;
           break;
-
         case FilterMode.betweenBuildings:
           _rGpsPosM = 7.0;
           _rHeadingDeg = 6.5;
@@ -126,7 +141,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _gateHeading = 2.5;
           _gpsSigmaScaleK = 0.7;
           break;
-
         case FilterMode.underTrees:
           _rGpsPosM = 6.5;
           _rHeadingDeg = 5.0;
@@ -136,7 +150,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _gateHeading = 2.8;
           _gpsSigmaScaleK = 0.6;
           break;
-
         case FilterMode.magneticDisturbance:
           _rGpsPosM = 3.5;
           _rHeadingDeg = 10.0;
@@ -146,7 +159,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _gateHeading = 5.0;
           _gpsSigmaScaleK = 0.5;
           break;
-
         case FilterMode.fastMovement:
           _rGpsPosM = 2.5;
           _rHeadingDeg = 4.0;
@@ -157,6 +169,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _gpsSigmaScaleK = 0.4;
           break;
       }
+      // Catatan: headingAlpha & maxDtSec tidak diubah oleh preset (tetap manual)
     });
   }
 
@@ -172,7 +185,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         gateGps: _gateGps,
         gateHeading: _gateHeading,
         headingOffsetDeg: _headingOffsetDeg,
-        presetMode: _selectedMode, // ⬅️ simpan preset yang sedang aktif
+        presetMode: _selectedMode,
+        // NEW
+        headingAlpha: _headingAlpha,
+        maxDtSec: _maxDtSec,
       ),
     );
     Navigator.pop(context);
@@ -384,6 +400,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 step: 1,
                 onChanged: (v) => setState(() => _gpsFilter = v),
               ),
+
+              // NEW: Heading smoothing alpha
+              _sliderWithSteppers(
+                title: 'Heading smoothing (alpha)',
+                unitLabel: '',
+                value: _headingAlpha,
+                min: 0.05,
+                max: 0.9,
+                step: 0.01,
+                divisions: 85,
+                onChanged: (v) => setState(() => _headingAlpha = double.parse(v.toStringAsFixed(2))),
+                toLabel: (v) => v.toStringAsFixed(2),
+              ),
+              const Padding(
+                padding: EdgeInsets.only(bottom: 6),
+                child: Text(
+                  'Semakin kecil → lebih halus tapi lambat; default 0.25',
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
             ]),
             _sectionCard('Model & Noise', [
               _sliderWithSteppers(
@@ -425,6 +461,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 step: 0.005,
                 divisions: 20,
                 onChanged: (v) => setState(() => _qHeadingDrift = v),
+              ),
+
+              // NEW: ESKF clamp dt
+              _sliderWithSteppers(
+                title: 'ESKF max dt (detik)',
+                unitLabel: ' s',
+                value: _maxDtSec,
+                min: 0.05,
+                max: 2.0,
+                step: 0.05,
+                divisions: 39,
+                onChanged: (v) => setState(() => _maxDtSec = double.parse(v.toStringAsFixed(2))),
+              ),
+              const Padding(
+                padding: EdgeInsets.only(bottom: 6),
+                child: Text(
+                  'Batasi dt saat jeda lama (default 0.5 s)',
+                  style: TextStyle(fontSize: 12),
+                ),
               ),
             ]),
             _sectionCard('Adaptasi & Gate', [

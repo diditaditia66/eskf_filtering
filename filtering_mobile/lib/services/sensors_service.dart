@@ -1,5 +1,6 @@
 // lib/services/sensors_service.dart
 import 'dart:async';
+import 'dart:math' as m;
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 
@@ -25,7 +26,32 @@ class SensorsService {
 
   // cache nilai terakhir dari sensor
   Position? _lastPos;
-  double _lastHeadingRad = 0.0;
+
+  // --- Heading smoothing state ---
+  double? _headingEmaRad;          // heading terhalus (EMA) dalam rad
+  double _alpha = 0.25;            // DEFAULT; diekspos ke Settings
+
+  // Setter/getter untuk Settings
+  void setHeadingSmoothingAlpha(double a) {
+    _alpha = a.clamp(0.05, 0.9);
+  }
+
+  double get headingSmoothingAlpha => _alpha;
+
+  // unwrap: bawa sudut baru dekat ke referensi lama
+  double _unwrap(double a, double ref) {
+    double d = a - ref;
+    while (d >  m.pi) d -= 2 * m.pi;
+    while (d < -m.pi) d += 2 * m.pi;
+    return ref + d;
+  }
+
+  // normalisasi ke -pi..pi
+  double _wrap(double a) {
+    double x = (a + m.pi) % (2 * m.pi);
+    if (x < 0) x += 2 * m.pi;
+    return x - m.pi;
+  }
 
   final _out = StreamController<GpsCompassSample>.broadcast();
   Stream<GpsCompassSample> get stream => _out.stream;
@@ -43,19 +69,34 @@ class SensorsService {
         perm == LocationPermission.whileInUse;
   }
 
-  /// Mulai baca sensor. `sampleEvery` = periode emisi output (default 1 detik).
+  /// Mulai baca sensor. `sampleEvery` = periode emisi output (default 200 ms).
   Future<void> start({
     int gpsDistanceFilterM = 0,
-    Duration sampleEvery = const Duration(seconds: 1),
+    Duration sampleEvery = const Duration(milliseconds: 200),
   }) async {
+    // Reset state heading ketika start
+    _headingEmaRad = null;
+
     // --- Kompas (biasanya cepat) ---
     _compassSub = FlutterCompass.events?.listen((event) {
-      final deg = (event.heading ?? 0.0).toDouble();
-      _lastHeadingRad = deg * 3.141592653589793 / 180.0;
+      final rawDeg = (event.heading ?? double.nan).toDouble();
+      if (!rawDeg.isFinite) return; // abaikan jika sensor belum siap
+
+      // Konversi ke rad lalu wrap -pi..pi
+      final rawRad = _wrap(rawDeg * m.pi / 180.0);
+
+      if (_headingEmaRad == null) {
+        // inisialisasi EMA pertama
+        _headingEmaRad = rawRad;
+      } else {
+        // unwrap relatif terhadap nilai EMA sebelumnya agar tidak lompat 360°
+        final uw = _unwrap(rawRad, _headingEmaRad!);
+        // EMA smoothing
+        _headingEmaRad = _alpha * uw + (1 - _alpha) * _headingEmaRad!;
+      }
     });
 
     // --- GPS stream (ambil secepat mungkin; kita throttle di luar) ---
-    // Untuk Android, kita coba set intervalDuration ~ 500ms agar cepat namun efisien.
     final base = LocationSettings(
       accuracy: LocationAccuracy.best,
       distanceFilter: gpsDistanceFilterM, // 0 = semua pergerakan
@@ -66,11 +107,10 @@ class SensorsService {
       settings = AndroidSettings(
         accuracy: LocationAccuracy.best,
         distanceFilter: gpsDistanceFilterM,
-        intervalDuration: const Duration(milliseconds: 500),
+        intervalDuration: const Duration(milliseconds: 200),
         forceLocationManager: false,
       );
     } catch (_) {
-      // jika bukan AndroidSettings, pakai base apa adanya
       settings = base;
     }
 
@@ -79,18 +119,24 @@ class SensorsService {
       _lastPos = pos; // simpan terakhir
     });
 
-    // --- Throttle output setiap 1 detik ---
+    // --- Emit periodik sesuai sampleEvery ---
     _tick?.cancel();
     _tick = Timer.periodic(sampleEvery, (_) {
       final p = _lastPos;
       if (p == null) return; // belum ada fix
 
+      // heading yang dipakai ke stream: EMA kalau sudah ada; jika belum, 0
+      final headingRad = _headingEmaRad ?? 0.0;
+
+      // pakai timestamp "sekarang" supaya dt bertambah terus di ESKF
+      final t = DateTime.now();
+
       _out.add(GpsCompassSample(
         lat: p.latitude,
         lon: p.longitude,
-        headingRad: _lastHeadingRad,
+        headingRad: headingRad,
         accuracyM: p.accuracy,
-        timestamp: DateTime.now(),
+        timestamp: t,
       ));
     });
   }

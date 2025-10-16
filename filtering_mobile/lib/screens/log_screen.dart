@@ -2,14 +2,49 @@
 import 'package:flutter/material.dart';
 import '../services/log_service.dart';
 
-/// Konversi derajat bertanda (−180..+180 atau sembarang) → 0..360 untuk TAMPILAN.
 double _toCompass360(double degSigned) {
   return (degSigned % 360 + 360) % 360;
 }
 
-class LogScreen extends StatelessWidget {
+class LogScreen extends StatefulWidget {
   final LogService logService;
   const LogScreen({super.key, required this.logService});
+
+  @override
+  State<LogScreen> createState() => _LogScreenState();
+}
+
+class _LogScreenState extends State<LogScreen> {
+  // Token untuk memaksa rebuild ulang anak-anak StreamBuilder setelah clearAll()
+  int _resetToken = 0;
+
+  Future<void> _confirmClearLogs() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Hapus semua log?'),
+        content: const Text('Tindakan ini akan menghapus seluruh data log yang tersimpan.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Batal')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Hapus'),
+          ),
+        ],
+      ),
+    );
+
+    if (ok == true) {
+      await widget.logService.clearAll();
+      if (!mounted) return;
+      // Paksa kedua tab re-build (StreamBuilder kehilangan snapshot lama)
+      setState(() => _resetToken++);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Semua log berhasil dihapus')),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -18,6 +53,13 @@ class LogScreen extends StatelessWidget {
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Logs'),
+          actions: [
+            IconButton(
+              tooltip: 'Clear logs',
+              icon: const Icon(Icons.delete_forever, color: Colors.red),
+              onPressed: _confirmClearLogs,
+            ),
+          ],
           bottom: const TabBar(
             tabs: [
               Tab(text: 'RAW'),
@@ -25,10 +67,11 @@ class LogScreen extends StatelessWidget {
             ],
           ),
         ),
-        body: const TabBarView(
+        body: TabBarView(
           children: [
-            _RawList(),
-            _FilteredList(),
+            // KUNCIKAN dengan resetToken supaya StreamBuilder di bawah benar-benar baru
+            _RawList(key: ValueKey('raw-$_resetToken'), logService: widget.logService),
+            _FilteredList(key: ValueKey('filt-$_resetToken'), logService: widget.logService),
           ],
         ),
       ),
@@ -36,10 +79,10 @@ class LogScreen extends StatelessWidget {
   }
 }
 
-/// RAW tab — keep-alive agar list tidak hilang saat pindah tab.
+/// RAW tab
 class _RawList extends StatefulWidget {
-  const _RawList();
-
+  final LogService logService;
+  const _RawList({super.key, required this.logService});
   @override
   State<_RawList> createState() => _RawListState();
 }
@@ -50,13 +93,16 @@ class _RawListState extends State<_RawList>
 
   @override
   Widget build(BuildContext context) {
-    super.build(context); // penting untuk keep-alive
-    final log = (context.findAncestorWidgetOfExactType<LogScreen>())!.logService;
+    super.build(context);
+    final log = widget.logService;
 
     return StreamBuilder<RawSample>(
       stream: log.recentRawStream,
       builder: (ctx, snap) {
+        // Ambil buffer yang SUDAH kosong setelah clearAll()
         final items = <RawSample>[...log.recentRawBuffer];
+
+        // Jika stream baru mengirim event, tambahkan ke atas (hingga _maxRows)
         if (snap.hasData) {
           items.insert(0, snap.data!);
           if (items.length > _maxRows) items.removeRange(_maxRows, items.length);
@@ -95,10 +141,10 @@ class _RawListState extends State<_RawList>
   bool get wantKeepAlive => true;
 }
 
-/// FILTERED tab — keep-alive juga.
+/// FILTERED tab
 class _FilteredList extends StatefulWidget {
-  const _FilteredList();
-
+  final LogService logService;
+  const _FilteredList({super.key, required this.logService});
   @override
   State<_FilteredList> createState() => _FilteredListState();
 }
@@ -109,13 +155,14 @@ class _FilteredListState extends State<_FilteredList>
 
   @override
   Widget build(BuildContext context) {
-    super.build(context); // penting untuk keep-alive
-    final log = (context.findAncestorWidgetOfExactType<LogScreen>())!.logService;
+    super.build(context);
+    final log = widget.logService;
 
     return StreamBuilder<FilteredSample>(
       stream: log.recentFilteredStream,
       builder: (ctx, snap) {
         final items = <FilteredSample>[...log.recentFilteredBuffer];
+
         if (snap.hasData) {
           items.insert(0, snap.data!);
           if (items.length > _maxRows) items.removeRange(_maxRows, items.length);
@@ -160,11 +207,7 @@ class _EmptyState extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Center(
-      child: Text(label,
-          style: TextStyle(
-            color: Colors.grey[600],
-            fontSize: 14,
-          )),
+      child: Text(label, style: TextStyle(color: Colors.grey[600], fontSize: 14)),
     );
   }
 }

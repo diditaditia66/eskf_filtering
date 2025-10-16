@@ -13,9 +13,19 @@ class ESKF2D {
   double qPosDrift;    // intensitas RW vel [m^2/s^3]
   double qHeading;     // intensitas RW yaw [rad^2/s]
 
+  // Health / debug
+  double lastDt = 0.0;
+  bool lastGpsAccepted = false;
+  bool lastHeadingAccepted = false;
+  double? lastGpsMahalanobis;
+  double? lastHeadingMahalanobis;
+
   // Gate terpisah (σ)
   double gateGps;
   double gateHeading;
+
+  // batas maksimum dt (detik) agar Q tidak meledak
+  double maxDtSec;
 
   bool _initialized = false;
   double _lastT = 0.0; // detik
@@ -27,6 +37,7 @@ class ESKF2D {
     required this.qHeading,
     required this.gateGps,
     required this.gateHeading,
+    this.maxDtSec = 0.5, // default clamp dt
   });
 
   /// Reset full state/cov
@@ -39,6 +50,11 @@ class ESKF2D {
     }
     _initialized = false;
     _lastT = 0.0;
+    lastDt = 0.0;
+    lastGpsAccepted = false;
+    lastHeadingAccepted = false;
+    lastGpsMahalanobis = null;
+    lastHeadingMahalanobis = null;
   }
 
   void _initFrom(double x, double y, double psi, double tSec) {
@@ -65,8 +81,12 @@ class ESKF2D {
 
   void predict(double tSec) {
     if (!_initialized) return;
+
+    // Clamp dt agar Q tidak meledak saat jeda lama (app background / data drop)
     double dt = tSec - _lastT;
-    if (dt <= 0) dt = 1e-3;
+    if (!dt.isFinite || dt <= 0) dt = 1e-3;
+    if (dt > maxDtSec) dt = maxDtSec;
+    lastDt = dt;
     _lastT = tSec;
 
     final F = [
@@ -122,7 +142,13 @@ class ESKF2D {
       [rGpsPosM * rGpsPosM, 0.0],
       [0.0, rGpsPosM * rGpsPosM],
     ];
-    _update(z, h, H, R, doGate: true, gateOverride: gateGps);
+    lastGpsMahalanobis = null;
+    lastGpsAccepted = _update(
+      z, h, H, R,
+      doGate: true,
+      gateOverride: gateGps,
+      onMahal: (m) => lastGpsMahalanobis = m,
+    );
   }
 
   void updateHeading(double psiRad) {
@@ -138,10 +164,18 @@ class ESKF2D {
     final R = [
       [rHeadingRad * rHeadingRad],
     ];
-    _update(z, h, H, R, doGate: true, circularIdx: 0, gateOverride: gateHeading);
+    lastHeadingMahalanobis = null;
+    lastHeadingAccepted = _update(
+      z, h, H, R,
+      doGate: true,
+      circularIdx: 0,
+      gateOverride: gateHeading,
+      onMahal: (m) => lastHeadingMahalanobis = m,
+    );
   }
 
-  void _update(
+  // return true jika update diterapkan; false jika tergate
+  bool _update(
     List<List<double>> z,
     List<List<double>> h,
     List<List<double>> H,
@@ -149,6 +183,7 @@ class ESKF2D {
     bool doGate = false,
     int? circularIdx,
     double? gateOverride,
+    void Function(double mahal)? onMahal, // NEW: untuk kirim nilai Mahalanobis
   }) {
     var v = _sub(z, h);
     if (circularIdx != null) {
@@ -159,18 +194,21 @@ class ESKF2D {
     final HPHt = _mul(HP, _transpose(H));
     final S = _add(HPHt, R);
 
+    final SinvG = _safeInv(S);
+    if (SinvG == null) return false;
+
     if (doGate) {
-      final Sinv = _inv(S);
-      if (Sinv == null) return;
       final vt = _transpose(v);
-      final mahal = _mul(_mul(vt, Sinv), v)[0][0];
+      final mahal = _mul(_mul(vt, SinvG), v)[0][0];
+      onMahal?.call(mahal);
       final th = gateOverride ?? 3.0;
-      if (mahal.isNaN || mahal > th * th) return;
+      if (mahal.isNaN || mahal > th * th) {
+        // ditolak oleh gate
+        return false;
+      }
     }
 
-    final Sinv = _inv(S);
-    if (Sinv == null) return;
-
+    final Sinv = SinvG;
     final PHt = _mul(_P, _transpose(H));
     final K = _mul(PHt, Sinv);
     final Kv = _mul(K, v);
@@ -188,7 +226,10 @@ class ESKF2D {
     final term2 = _mul(KR, _transpose(K));
     final Pn = _add(term1, term2);
     _copyTo(Pn, _P);
+
+    return true; // update diterapkan
   }
+
 
   // --- Utils matrix ---
   List<List<double>> _mul(List<List<double>> A, List<List<double>> B) {
@@ -242,6 +283,19 @@ class ESKF2D {
     for (int i = 0; i < src.length; i++) {
       for (int j = 0; j < src[0].length; j++) dst[i][j] = src[i][j];
     }
+  }
+
+  // Invers yang robust dengan jitter diagonal jika perlu
+  List<List<double>>? _safeInv(List<List<double>> A) {
+    final inv1 = _inv(A);
+    if (inv1 != null) return inv1;
+    final n = A.length;
+    final B = List.generate(n, (i) => List<double>.from(A[i]));
+    const double eps = 1e-6;
+    for (var i = 0; i < n; i++) {
+      B[i][i] += eps;
+    }
+    return _inv(B);
   }
 
   List<List<double>>? _inv(List<List<double>> A) {

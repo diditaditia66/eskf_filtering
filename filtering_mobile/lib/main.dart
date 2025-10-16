@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'services/sensors_service.dart';
 import 'services/fusion_service.dart';
@@ -10,11 +11,13 @@ import 'services/log_service.dart';
 
 import 'screens/log_screen.dart';
 import 'screens/settings_screen.dart';
-import 'screens/map_screen.dart'; // Map dari log (tanpa FMTC)
+import 'screens/map_screen.dart';
+
+const _kWsUrlPrefKey = 'ws_url';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await dotenv.load(fileName: ".env"); // baca token Mapbox dari .env
+  await dotenv.load(fileName: ".env");
   runApp(const FilteringApp());
 }
 
@@ -32,9 +35,7 @@ class FilteringApp extends StatelessWidget {
         scaffoldBackgroundColor: Colors.grey[50],
         cardTheme: CardTheme(
           elevation: 2,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-          ),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         ),
         appBarTheme: const AppBarTheme(
           backgroundColor: Colors.white,
@@ -49,7 +50,6 @@ class FilteringApp extends StatelessWidget {
 
 class FilteringHome extends StatefulWidget {
   const FilteringHome({super.key});
-
   @override
   State<FilteringHome> createState() => _FilteringHomeState();
 }
@@ -65,15 +65,18 @@ class _FilteringHomeState extends State<FilteringHome> {
   StreamSubscription<FilteredOutput>? _fusedSub;
   StreamSubscription<bool>? _wsConnSub;
 
+  // HUD
+  StreamSubscription<FusionHealth>? _healthSub;
+  StreamSubscription<double>? _rttSub;
+  double? _lastRttMs;
+  int _queueLen = 0;
+  double _emaSigma = 0.0;
+  double _lastDt = 0.0;
+  int _gpsAcc = 0, _gpsRej = 0, _hdgAcc = 0, _hdgRej = 0;
+
   bool _running = false;
   bool _wsConnected = false;
-  String _last = '-';
   int _gpsDistanceFilterM = 1;
-
-  double _toCompass360(double rad) {
-    final deg = rad * 180.0 / math.pi;
-    return (deg % 360 + 360) % 360;
-  }
 
   @override
   void initState() {
@@ -87,6 +90,39 @@ class _FilteringHomeState extends State<FilteringHome> {
       if (!mounted) return;
       setState(() => _wsConnected = ok);
     });
+
+    // HUD subscriptions
+    _healthSub = _fusion.healthStream.listen((h) {
+      if (!mounted) return;
+      setState(() {
+        _emaSigma = h.emaSigmaGps;
+        _lastDt = h.lastDtSec;
+        _gpsAcc = h.gpsAccepted;
+        _gpsRej = h.gpsRejected;
+        _hdgAcc = h.hdgAccepted;
+        _hdgRej = h.hdgRejected;
+      });
+    });
+
+    _rttSub = _transport.rttStream.listen((ms) {
+      if (!mounted) return;
+      setState(() => _lastRttMs = ms);
+    });
+
+    _loadInitialWsUrl();
+  }
+
+  Future<void> _loadInitialWsUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_kWsUrlPrefKey);
+    if (saved != null && saved.isNotEmpty) {
+      setState(() => _wsUrl = saved);
+      return;
+    }
+    final envUrl = dotenv.env['WS_URL'];
+    if (envUrl != null && envUrl.isNotEmpty) {
+      setState(() => _wsUrl = envUrl);
+    }
   }
 
   @override
@@ -94,9 +130,11 @@ class _FilteringHomeState extends State<FilteringHome> {
     _rawSub?.cancel();
     _fusedSub?.cancel();
     _wsConnSub?.cancel();
+    _healthSub?.cancel();
+    _rttSub?.cancel();
     _fusion.dispose();
     _sensors.dispose();
-    _transport.close();
+    _transport.closeAndStopRetry();
     _log.close();
     super.dispose();
   }
@@ -110,6 +148,11 @@ class _FilteringHomeState extends State<FilteringHome> {
   }
 
   Future<void> _start() async {
+    if (_wsUrl.trim().isEmpty) {
+      await _editWsUrl();
+      if (_wsUrl.trim().isEmpty) return;
+    }
+
     await _log.open();
 
     _rawSub = _sensors.stream.listen((s) {
@@ -123,7 +166,6 @@ class _FilteringHomeState extends State<FilteringHome> {
     });
 
     _fusedSub = _fusion.stream.listen((o) {
-      final headingDegForUi = _toCompass360(o.headingRad);
       final headingDegForLog = o.headingRad * 180.0 / math.pi;
 
       _log.logFiltered(FilteredSample(
@@ -133,26 +175,18 @@ class _FilteringHomeState extends State<FilteringHome> {
         heading: headingDegForLog,
       ));
 
-      if (_transport.isConnected) {
-        _transport.sendFusionSample(
-          lat: o.lat,
-          lon: o.lon,
-          headingDeg: headingDegForLog,
-          timestamp: o.t,
-        );
-      }
+      _transport.sendFusionSample(
+        lat: o.lat,
+        lon: o.lon,
+        headingDeg: headingDegForLog,
+        timestamp: o.t,
+        accuracyM: o.accuracyM,
+      );
 
-      if (mounted) {
-        setState(() {
-          _last =
-              'lat=${o.lat.toStringAsFixed(6)}, lon=${o.lon.toStringAsFixed(6)}, hdg=${headingDegForUi.toStringAsFixed(1)}°';
-        });
-      }
+      if (mounted) setState(() => _queueLen = _transport.queueLength);
     });
 
-    try {
-      await _transport.connect(_wsUrl);
-    } catch (_) {}
+    _transport.connectWithRetry(_wsUrl);
 
     await _fusion.start(gpsDistanceFilterM: _gpsDistanceFilterM);
     if (mounted) setState(() => _running = true);
@@ -162,7 +196,7 @@ class _FilteringHomeState extends State<FilteringHome> {
     await _fusion.stop();
     await _rawSub?.cancel();
     await _fusedSub?.cancel();
-    await _transport.close();
+    await _transport.closeAndStopRetry();
     await _log.close();
     if (mounted) setState(() => _running = false);
   }
@@ -179,6 +213,8 @@ class _FilteringHomeState extends State<FilteringHome> {
             labelText: 'ws://host:port',
             border: OutlineInputBorder(),
           ),
+          keyboardType: TextInputType.url,
+          autofillHints: const [AutofillHints.url],
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context), child: const Text('Batal')),
@@ -188,11 +224,12 @@ class _FilteringHomeState extends State<FilteringHome> {
     );
     if (newUrl != null && newUrl.isNotEmpty) {
       setState(() => _wsUrl = newUrl);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kWsUrlPrefKey, _wsUrl);
+
       if (_running) {
-        await _transport.close();
-        try {
-          await _transport.connect(_wsUrl);
-        } catch (_) {}
+        await _transport.closeAndStopRetry();
+        _transport.connectWithRetry(_wsUrl);
       }
     }
   }
@@ -216,6 +253,8 @@ class _FilteringHomeState extends State<FilteringHome> {
             gateGps: _fusion.gateGps,
             gateHeading: _fusion.gateHeading,
             headingOffsetDeg: _fusion.headingOffsetDeg,
+            headingAlpha: _sensors.headingSmoothingAlpha,
+            maxDtSec: _fusion.clampDtMaxSec,
           ),
           onApply: (p) async {
             _fusion.setAdvancedParams(
@@ -227,7 +266,10 @@ class _FilteringHomeState extends State<FilteringHome> {
             _fusion.setAdaptiveGpsK(p.gpsSigmaScaleK);
             _fusion.setGates(gateGps: p.gateGps, gateHeading: p.gateHeading);
             _fusion.setHeadingOffsetDeg(p.headingOffsetDeg);
+            _sensors.setHeadingSmoothingAlpha(p.headingAlpha);
+            _fusion.setClampDtMax(p.maxDtSec);
             _gpsDistanceFilterM = p.gpsDistanceFilterM;
+
             if (mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(content: Text('Parameter disimpan')),
@@ -239,41 +281,62 @@ class _FilteringHomeState extends State<FilteringHome> {
     );
   }
 
-  // Map: tampilkan perbandingan log Raw & Filtered (statis dari log)
   void _openMap() {
     Navigator.push(context, MaterialPageRoute(builder: (_) => MapScreen(logService: _log)));
   }
 
-  Future<void> _confirmClearLogs() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Hapus semua log?'),
-        content: const Text('Tindakan ini akan menghapus seluruh data log yang tersimpan.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Batal')),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Hapus'),
-          ),
+  // ================= Helper warna & indikator =================
+  Color _sevColor(num? v, List<num> th) {
+    if (v == null) return Colors.grey;
+    if (v <= th[0]) return Colors.green;
+    if (v <= th[1]) return Colors.orange;
+    return Colors.red;
+  }
+
+  Color _ratioColor(int acc, int rej) {
+    final tot = acc + rej;
+    if (tot < 10) return Colors.grey;
+    final r = rej / tot;
+    if (r <= 0.20) return Colors.green;
+    if (r <= 0.40) return Colors.orange;
+    return Colors.red;
+  }
+
+  Widget _indicatorBox({
+    required String title,
+    required String value,
+    required Color color,
+  }) {
+    return Container(
+      constraints: const BoxConstraints(minHeight: 64),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 2, offset: Offset(0, 1))],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(title,
+              style: const TextStyle(fontSize: 12, color: Colors.white70, fontWeight: FontWeight.w600),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis),
+          const SizedBox(height: 2),
+          Text(value,
+              style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w800, color: Colors.white),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis),
         ],
       ),
     );
-
-    if (confirm == true) {
-      await _log.clearAll();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Semua log berhasil dihapus')),
-        );
-      }
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    _queueLen = _transport.queueLength;
 
     return Scaffold(
       body: SafeArea(
@@ -298,6 +361,83 @@ class _FilteringHomeState extends State<FilteringHome> {
                   trailing: IconButton(icon: const Icon(Icons.edit), onPressed: _editWsUrl),
                 ),
               ),
+              const SizedBox(height: 12),
+
+              // ------- LIVE HUD -------
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Expanded(
+                            child: Text('Live HUD',
+                                style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+                          ),
+                          TextButton.icon(
+                            style: TextButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                              foregroundColor: Colors.indigo,
+                            ),
+                            onPressed: () {
+                              _fusion.resetHealth();
+                              // Sinkronkan UI segera
+                              setState(() {
+                                _gpsAcc = _gpsRej = _hdgAcc = _hdgRej = 0;
+                              });
+                            },
+                            icon: const Icon(Icons.restart_alt, size: 18),
+                            label: const Text('Reset'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      LayoutBuilder(
+                        builder: (context, constraints) {
+                          final isThreeCol = constraints.maxWidth >= 380;
+                          final crossCount = isThreeCol ? 3 : 2;
+                          const gap = 8.0;
+                          final aspect = isThreeCol ? 2.8 : 2.3;
+
+                          final rttColor   = _sevColor(_lastRttMs, [150, 300]);
+                          final qColor     = _sevColor(_queueLen, [0, 20]);
+                          final sigmaColor = _sevColor(_emaSigma, [4, 8]);
+                          final dtColor    = _sevColor(_lastDt, [0.30, 0.60]);
+                          final gpsColor   = _ratioColor(_gpsAcc, _gpsRej);
+                          final hdgColor   = _ratioColor(_hdgAcc, _hdgRej);
+
+                          final items = <Widget>[
+                            _indicatorBox(title: 'RTT',
+                              value: _lastRttMs != null ? '${_lastRttMs!.toStringAsFixed(0)} ms' : '—',
+                              color: rttColor),
+                            _indicatorBox(title: 'WS Queue', value: '$_queueLen', color: qColor),
+                            _indicatorBox(title: 'σ_GPS (EMA)', value: '${_emaSigma.toStringAsFixed(1)} m', color: sigmaColor),
+                            _indicatorBox(title: 'dt', value: '${_lastDt.toStringAsFixed(3)} s', color: dtColor),
+                            _indicatorBox(title: 'GPS acc/rej', value: '$_gpsAcc / $_gpsRej', color: gpsColor),
+                            _indicatorBox(title: 'HDG acc/rej', value: '$_hdgAcc / $_hdgRej', color: hdgColor),
+                          ];
+
+                          return GridView.builder(
+                            physics: const NeverScrollableScrollPhysics(),
+                            shrinkWrap: true,
+                            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: crossCount,
+                              crossAxisSpacing: gap,
+                              mainAxisSpacing: gap,
+                              childAspectRatio: aspect,
+                            ),
+                            itemCount: items.length,
+                            itemBuilder: (_, i) => items[i],
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
               const SizedBox(height: 16),
 
               FilledButton.icon(
@@ -332,26 +472,6 @@ class _FilteringHomeState extends State<FilteringHome> {
                 icon: const Icon(Icons.map_outlined),
                 label: const Text('BUKA PETA (LOG)'),
                 style: OutlinedButton.styleFrom(minimumSize: const Size(double.infinity, 54)),
-              ),
-              const SizedBox(height: 12),
-
-              FilledButton.icon(
-                onPressed: _confirmClearLogs,
-                icon: const Icon(Icons.delete_forever),
-                label: const Text('CLEAR LOGS'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: Colors.red,
-                  minimumSize: const Size(double.infinity, 54),
-                ),
-              ),
-              const SizedBox(height: 24),
-
-              Card(
-                child: ListTile(
-                  leading: const Icon(Icons.navigation_outlined),
-                  title: const Text('Output Terakhir'),
-                  subtitle: Text(_last, style: const TextStyle(fontSize: 14)),
-                ),
               ),
             ],
           ),

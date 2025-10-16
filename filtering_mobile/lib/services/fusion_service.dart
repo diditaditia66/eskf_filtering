@@ -22,6 +22,25 @@ class FilteredOutput {
   });
 }
 
+// Live health untuk HUD
+class FusionHealth {
+  final double emaSigmaGps;
+  final int gpsAccepted;
+  final int gpsRejected;
+  final int hdgAccepted;
+  final int hdgRejected;
+  final double lastDtSec;
+
+  const FusionHealth({
+    required this.emaSigmaGps,
+    required this.gpsAccepted,
+    required this.gpsRejected,
+    required this.hdgAccepted,
+    required this.hdgRejected,
+    required this.lastDtSec,
+  });
+}
+
 class FusionService {
   final SensorsService _sensors;
   StreamSubscription<GpsCompassSample>? _sub;
@@ -43,13 +62,27 @@ class FusionService {
 
   double _headingOffsetDeg = 0.0;
 
+  // NEW: smoothing heading internal (ringan; beda dari alpha di SensorsService)
+  double _headingFiltered = 0.0;
+  double _headingSmoothAlpha = 0.35;
+
+  // clamp dt maksimum untuk ESKF (exposed ke Settings)
+  double _maxDtSec = 0.5;
+
   final _out = StreamController<FilteredOutput>.broadcast();
   Stream<FilteredOutput> get stream => _out.stream;
+
+  // Health stream & counters
+  final _healthCtrl = StreamController<FusionHealth>.broadcast();
+  Stream<FusionHealth> get healthStream => _healthCtrl.stream;
+  int _gpsAccepted = 0, _gpsRejected = 0, _hdgAccepted = 0, _hdgRejected = 0;
 
   bool _running = false;
 
   FusionService({SensorsService? sensors})
       : _sensors = sensors ?? SensorsService();
+
+  // ------------------ Public setters / getters ------------------
 
   void setAdvancedParams({
     double? rGpsPosM,
@@ -69,12 +102,23 @@ class FusionService {
         ..qPosDrift = _qPosDrift
         ..qHeading = _qHeadingDrift
         ..gateGps = _gateGps
-        ..gateHeading = _gateHeading;
+        ..gateHeading = _gateHeading
+        ..maxDtSec = _maxDtSec;
     }
   }
 
   void setAdaptiveGpsK(double k) => _adaptiveK = k.clamp(0.2, 1.0);
   void setHeadingOffsetDeg(double d) => _headingOffsetDeg = d;
+
+  // setter/getter clamp dt
+  void setClampDtMax(double s) {
+    _maxDtSec = s.clamp(0.05, 2.0);
+    if (_eskf != null) {
+      _eskf!.maxDtSec = _maxDtSec;
+    }
+  }
+
+  double get clampDtMaxSec => _maxDtSec;
 
   void setGates({double? gateGps, double? gateHeading}) {
     if (gateGps != null) _gateGps = gateGps.clamp(1.0, 10.0);
@@ -90,6 +134,23 @@ class FusionService {
     _frame = null;
     _eskf = null;
   }
+
+  /// Reset hanya COUNTERS (acc/rej) untuk HUD — tidak mengubah state filter.
+  void resetHealth() {
+    _gpsAccepted = _gpsRejected = _hdgAccepted = _hdgRejected = 0;
+    if (!_healthCtrl.isClosed) {
+      _healthCtrl.add(FusionHealth(
+        emaSigmaGps: _emaSigmaGps,
+        gpsAccepted: _gpsAccepted,
+        gpsRejected: _gpsRejected,
+        hdgAccepted: _hdgAccepted,
+        hdgRejected: _hdgRejected,
+        lastDtSec: _eskf?.lastDt ?? 0.0,
+      ));
+    }
+  }
+
+  // ------------------ Lifecycle ------------------
 
   Future<void> start({int gpsDistanceFilterM = 1}) async {
     if (_running) return;
@@ -113,13 +174,23 @@ class FusionService {
   Future<void> dispose() async {
     await stop();
     await _out.close();
+    await _healthCtrl.close();
   }
 
+  // ------------------ Processing ------------------
+
   void _onSample(GpsCompassSample s) {
+    // Origin ENU di-lock pada fix pertama
     _frame ??= LocalFrame(s.lat, s.lon);
+
+    // Offset heading dari Settings diaplikasikan
     final headingMag =
         (s.headingRad.isNaN || !s.headingRad.isFinite) ? 0.0 : s.headingRad;
     final headingTrue = headingMag + _deg2rad(_headingOffsetDeg);
+
+    // NEW: smoothing ringan untuk heading (stabilkan saat loncat)
+    _headingFiltered =
+        _headingSmoothAlpha * headingTrue + (1 - _headingSmoothAlpha) * _headingFiltered;
 
     _eskf ??= ESKF2D(
       rGpsPosM: _rGpsPosM,
@@ -128,12 +199,14 @@ class FusionService {
       qHeading: _qHeadingDrift,
       gateGps: _gateGps,
       gateHeading: _gateHeading,
+      maxDtSec: _maxDtSec,
     );
 
     final enu = _frame!.llToEnu(s.lat, s.lon);
     final xMeas = enu[0];
     final yMeas = enu[1];
 
+    // Adaptive R dari accuracy (EMA)
     if (s.accuracyM != null && s.accuracyM! > 0) {
       final rawSigma = (s.accuracyM! * _adaptiveK).clamp(0.5, 50.0);
       _emaSigmaGps = _emaAlpha * rawSigma + (1 - _emaAlpha) * _emaSigmaGps;
@@ -142,21 +215,69 @@ class FusionService {
       _eskf!.rGpsPosM = _rGpsPosM;
     }
 
+    // NEW: Adaptive gating GPS berdasarkan noise
+    // -> perketat saat noise besar; longgarkan saat noise kecil.
+    if (_emaSigmaGps > 8.0) {
+      _gateGps = 2.5;
+    } else if (_emaSigmaGps < 4.0) {
+      _gateGps = 4.5;
+    }
+
+    // Pastikan parameter runtime sinkron
     _eskf!
       ..rHeadingRad = _deg2rad(_rHeadingDeg)
       ..qPosDrift = _qPosDrift
       ..qHeading = _qHeadingDrift
       ..gateGps = _gateGps
-      ..gateHeading = _gateHeading;
+      ..gateHeading = _gateHeading
+      ..maxDtSec = _maxDtSec;
 
+    // waktu sample dari SensorsService sudah "sekarang" -> dt dikontrol di ESKF
     final tSec = s.timestamp.millisecondsSinceEpoch / 1000.0;
     _eskf!.step(
       tSec: tSec,
       gpsX: xMeas,
       gpsY: yMeas,
-      headingRad: headingTrue,
+      // NEW: pakai heading yang sudah di-smooth
+      headingRad: _headingFiltered,
     );
 
+    // Update health counters dari status terakhir ESKF
+    if (_eskf!.lastGpsMahalanobis != null) {
+      if (_eskf!.lastGpsAccepted) {
+        _gpsAccepted++;
+      } else {
+        _gpsRejected++;
+      }
+    }
+    if (_eskf!.lastHeadingMahalanobis != null) {
+      if (_eskf!.lastHeadingAccepted) {
+        _hdgAccepted++;
+      } else {
+        _hdgRejected++;
+      }
+    }
+
+    // Emit health snapshot
+    if (!_healthCtrl.isClosed) {
+      _healthCtrl.add(FusionHealth(
+        emaSigmaGps: _eskf!.rGpsPosM,
+        gpsAccepted: _gpsAccepted,
+        gpsRejected: _gpsRejected,
+        hdgAccepted: _hdgAccepted,
+        hdgRejected: _hdgRejected,
+        lastDtSec: _eskf!.lastDt,
+      ));
+    }
+
+    // NEW: Auto reset jika kondisi buruk (divergen) terdeteksi
+    if (_eskf!.rGpsPosM > 50.0 || _eskf!.lastDt > 2.0) {
+      resetState();
+      resetHealth();
+      return;
+    }
+
+    // Emit filtered output
     final x = _eskf!.x;
     final y = _eskf!.y;
     final yaw = _eskf!.psi;
@@ -172,6 +293,8 @@ class FusionService {
       ));
     }
   }
+
+  // ------------------ Read-only props ------------------
 
   bool get isRunning => _running;
   double get rGpsPosM => _rGpsPosM;
